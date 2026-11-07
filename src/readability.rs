@@ -457,29 +457,74 @@ fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|s| !s.is_empty())
 }
 
+/// Splits a `style` attribute into declarations as CSS does: `;` inside
+/// strings, parentheses, brackets or braces does not end a declaration, and
+/// comments separate tokens like white space (`display: /* x */ none` is
+/// `none`, `no/**/ne` is two words).
+fn css_declarations(style: &str) -> Vec<String> {
+    let mut decls = Vec::new();
+    let mut cur = String::new();
+    let mut nesting: Vec<char> = Vec::new();
+    let mut chars = style.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                cur.push(' ');
+            }
+            '"' | '\'' => {
+                cur.push(c);
+                while let Some(d) = chars.next() {
+                    cur.push(d);
+                    if d == '\\' {
+                        if let Some(e) = chars.next() {
+                            cur.push(e);
+                        }
+                    } else if d == c {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                cur.push(c);
+                if let Some(e) = chars.next() {
+                    cur.push(e);
+                }
+            }
+            '(' | '[' | '{' => {
+                nesting.push(match c {
+                    '(' => ')',
+                    '[' => ']',
+                    _ => '}',
+                });
+                cur.push(c);
+            }
+            ')' | ']' | '}' => {
+                if nesting.last() == Some(&c) {
+                    nesting.pop();
+                }
+                cur.push(c);
+            }
+            ';' if nesting.is_empty() => decls.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    decls.push(cur);
+    decls
+}
+
 /// Parses the `style` attribute just enough to read `display` and
 /// `visibility` (the last valid declaration wins).
 fn style_property(style: &str, name: &str) -> Option<String> {
-    // CSS comments separate tokens like white space (`display: /* x */ none`
-    // is `none`, `no/**/ne` is two words), and may contain `;`.
-    let style: std::borrow::Cow<str> = if style.contains("/*") {
-        let mut out = String::with_capacity(style.len());
-        let mut rest = style;
-        while let Some(i) = rest.find("/*") {
-            out.push_str(&rest[..i]);
-            out.push(' ');
-            rest = match rest[i + 2..].find("*/") {
-                Some(j) => &rest[i + 2 + j + 2..],
-                None => "",
-            };
-        }
-        out.push_str(rest);
-        out.into()
-    } else {
-        style.into()
-    };
     let mut value = None;
-    for decl in style.split(';') {
+    for decl in css_declarations(style) {
         let Some((prop, val)) = decl.split_once(':') else { continue };
         if !js::trim(prop).eq_ignore_ascii_case(name) {
             continue;
@@ -2702,5 +2747,21 @@ mod tests {
         assert_ne!(style_property("display: no/**/ne", "display").as_deref(), Some("none"));
         assert_ne!(style_property("display: \"none\"", "display").as_deref(), Some("none"));
         assert_eq!(style_property("visibility: /*c*/hidden", "visibility").as_deref(), Some("hidden"));
+        // `;` inside strings and blocks does not end a declaration (jsdom: no display).
+        for style in [
+            "--label: \";display:none;\"",
+            "background:url(a;display:none)",
+            "content:'a;display:none'",
+            "--x: {a;display:none}; color: red",
+            "content:\"/*\";display:none",
+        ] {
+            let v = style_property(style, "display");
+            if style.starts_with("content:\"/*") {
+                assert_eq!(v.as_deref(), Some("none"), "{style}");
+            } else {
+                assert_eq!(v, None, "{style}");
+            }
+        }
+        assert_eq!(style_property("display:none;--a:\"b\"", "display").as_deref(), Some("none"));
     }
 }

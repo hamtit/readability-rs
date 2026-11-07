@@ -1,6 +1,6 @@
 # readability-rs
 
-[Mozilla Readability](https://github.com/mozilla/readability)（Firefox のリーダービューで使われている記事本文の抽出ライブラリ）を Rust に移植したもの。Bun と Node.js から使える Node-API アドオンと、Rust のライブラリとして使える。
+[Mozilla Readability](https://github.com/mozilla/readability)（Firefox のリーダービューで使われている記事本文の抽出ライブラリ）を Rust に移植したもの。Bun と Node.js から使える Node-API アドオン、ブラウザや Workers でも動く WebAssembly 版、Rust のライブラリとして使える。
 
 Readability.js は DOM（jsdom、linkedom など）の上で動くので、抽出そのものより DOM の構築と操作に時間とメモリを使う。HTML の解析から本文の抽出までを Rust で行い、結果を変えずにどこまで速くなるかを確かめるために作った。測定結果は [ベンチマーク](#ベンチマーク) を参照。
 
@@ -39,6 +39,15 @@ isProbablyReaderable(html); // isProbablyReaderable(document) と同じ判定
 
 `url` は相対 URL の解決（`<base href>` を含む）に使う。省略すると相対 URL はそのまま残る。その他のオプション（`charThreshold`、`nbTopCandidates`、`classesToPreserve`、`keepClasses`、`disableJSONLD`、`maxElemsToParse`、`linkDensityModifier`）は Readability.js と同じ。型は `index.d.ts` を参照。
 
+WebAssembly 版（`readability-rs-wasm`）は、初期化のあと同じ API を同期で呼ぶ（スレッドを使わないので `parseAsync` はない）。Node-API アドオンが使えない環境（musl、macOS、Windows、ブラウザ、Cloudflare Workers など）向け。
+
+```ts
+import createReadability from 'readability-rs-wasm';
+
+const readability = await createReadability(); // dist/readability.wasm を読み込む。{ wasmBinary } / { module } でも渡せる
+readability.parse(html, { url });
+```
+
 Rust からは:
 
 ```rust
@@ -47,14 +56,15 @@ let article = readability_rs::parse(html, Some("https://example.com/post/1"), &D
 
 ## ビルド
 
-Linux（glibc / musl、x64 / arm64）向け。必要なものは Rust だけ（依存はすべて Rust のクレートで、C のライブラリを使わない）。
+Node-API アドオンは Linux（glibc / musl、x64 / arm64）向け。必要なものは Rust だけ（依存はすべて Rust のクレートで、C のライブラリを使わない）。
 
 ```bash
 ./scripts/build.sh                 # readability-rs.linux-<arch>-<libc>.node を作る
+./scripts/build-wasm.sh out/wasm   # WebAssembly 版（rustup target add wasm32-unknown-unknown が必要）
 ./scripts/fetch-test-pages.sh      # 上流のテストページ（約 30MB、コミットしていない）を tests/test-pages/ に取得
 cargo test --release --no-default-features
 bun install && bun test tests/
-(cd bench && bun install && bun compare.ts)   # Readability.js との出力比較（PAGES_DIR=<dir> で手元の HTML も比べる）
+(cd bench && bun install && bun compare.ts)   # Readability.js との出力比較（アドオンと、ビルド済みなら wasm 版。PAGES_DIR=<dir> で手元の HTML も比べる）
 ```
 
 ## リリース
@@ -66,21 +76,22 @@ bun install && bun test tests/
 
 `main` への push でもタグがすでにあれば、ビルドとテストだけを行う。`v<version>` のタグを手で push してもリリースされる（`Cargo.toml` と合わない名前のタグは拒否）。PR と手動実行では、ビルド・テスト・パッケージ作成までを行い、パッケージはワークフローのアーティファクトに残る。
 
-Release には 3 つの npm tarball が付く。npm レジストリには公開していないので、Release の URL で依存する。
+Release には 4 つの npm tarball が付く。npm レジストリには公開していないので、Release の URL で依存する。
 
 | ファイル | 内容 |
 |---|---|
 | `readability-rs-linux-x64-<version>.tgz` | Linux x64（glibc）のアドオンだけ |
 | `readability-rs-linux-arm64-<version>.tgz` | Linux arm64（glibc）のアドオンだけ |
 | `readability-rs-<version>.tgz` | x64 と arm64 を 1 つにまとめたもの |
+| `readability-rs-wasm-<version>.tgz` | WebAssembly 版（[packages/wasm](packages/wasm/README.md)） |
 
-x64 / arm64 の単体パッケージは `os` / `cpu` を持つので、`optionalDependencies` に両方並べればパッケージマネージャーが合う方だけ入れる。どれも Debian bookworm（`oven/bun:*-debian` と同じ glibc）でビルドし、依存クレートのライセンス文書（`licenses/`）を含む。
+x64 / arm64 の単体パッケージは `os` / `cpu` を持つので、`optionalDependencies` に両方並べればパッケージマネージャーが合う方だけ入れる。アドオンは Debian bookworm（`oven/bun:*-debian` と同じ glibc）でビルドする。どのパッケージも依存クレートのライセンス文書（`licenses/`）を含む。
 
 ```sh
 npm install https://github.com/hamtit/readability-rs/releases/download/v0.1.0/readability-rs-0.1.0.tgz
 ```
 
-CI では、x64 と arm64 のそれぞれで、Rust のテスト（上流のテストページを含む）、アドオンのテスト、Readability.js との出力比較（上流のテストページ）を行う。
+CI では、x64 と arm64 のそれぞれで、Rust のテスト（上流のテストページを含む）、アドオンのテスト、Readability.js との出力比較（上流のテストページ）を行う。WebAssembly 版もビルドして同じ出力比較を行い、パッケージをインストールして動作を確かめる。
 
 ## ベンチマーク
 
@@ -103,6 +114,19 @@ CI では、x64 と arm64 のそれぞれで、Rust のテスト（上流のテ�
 | Node.js: linkedom + Readability.js | 4.19 s | 20.9 / 77 ms | 551 MB |
 | Node.js: **readability-rs `parse`** | **0.53 s** | **3.4 / 7.3 ms** | **146 MB** |
 | Node.js: readability-rs `parseAsync`（4 並列） | 0.21 s | | 194 MB |
+
+### WebAssembly 版
+
+アドオンとは別の時点で測ったので、同じ条件でアドオンも測り直して並べた（アドオンの値は上の表とほぼ同じ）。
+
+| | Bun: アドオン | Bun: wasm | Node.js: アドオン | Node.js: wasm |
+|---|---|---|---|---|
+| 実在の記事 113 件 | 0.54 s / 125 MB | 0.64 s / 221 MB | 0.56 s / 147 MB | 0.76 s / 208 MB |
+| 上流のテストページ 128 件 | 0.45 s / 128 MB | 0.51 s / 203 MB | 0.54 s / 157 MB | 0.69 s / 221 MB |
+
+（全体の時間 / ピーク RSS）
+
+wasm 版はアドオンより 15〜35% 遅いが、linkedom + Readability.js（Bun で 3.94 s / 500 MB）より 6 倍ほど速い。メモリが多いのは、wasm の線形メモリが一度伸びると縮まないため。
 
 ### 上流のテストページ 128 件
 

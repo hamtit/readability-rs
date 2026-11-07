@@ -39,9 +39,10 @@ function withNulls(article) {
   return article;
 }
 
-module.exports = {
-  parse: (html, options) => withNulls(native.parse(html, nativeOptions(options))),
-  parseAsync: async (html, options, signal) => withNulls(await native.parseAsync(html, nativeOptions(options), signal)),
-  isProbablyReaderable: native.isProbablyReaderable,
-  versions: native.versions,
-};
+// Plain `exports.name =` assignments so Node.js ESM can detect the named
+// exports (`import { parse } from 'readability-rs'`).
+exports.parse = (html, options) => withNulls(native.parse(html, nativeOptions(options)));
+exports.parseAsync = async (html, options, signal) =>
+  withNulls(await native.parseAsync(html, nativeOptions(options), signal));
+exports.isProbablyReaderable = native.isProbablyReaderable;
+exports.versions = native.versions;
