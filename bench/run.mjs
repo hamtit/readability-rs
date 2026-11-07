@@ -2,7 +2,8 @@
 //
 //   bun run.mjs <scenario> <set> [rounds]     (also works with node)
 //
-// scenario: jsdom | linkedom | rs | rs-async
+// scenario: jsdom | linkedom | rs | rs-async | rs-wasm (WASM=<readability.wasm>,
+//           default ../out/wasm/dist/readability.wasm from scripts/build-wasm.sh)
 // set:      test-pages | local (HTML files in PAGES_DIR, see pages.ts)
 //
 // Each round parses every page once (HTML string -> article, including
@@ -38,7 +39,7 @@ function loadPages() {
   return pages;
 }
 
-function makeParser() {
+async function makeParser() {
   if (scenario === 'jsdom') {
     const { JSDOM, VirtualConsole } = require('jsdom');
     const { Readability } = require('@mozilla/readability');
@@ -57,6 +58,12 @@ function makeParser() {
       return new Readability(doc).parse();
     };
   }
+  if (scenario === 'rs-wasm') {
+    const { default: createReadability } = await import('../packages/wasm/index.js');
+    const file = process.env.WASM ?? join(here, '..', 'out', 'wasm', 'dist', 'readability.wasm');
+    const r = await createReadability({ wasmBinary: readFileSync(file) });
+    return (p) => r.parse(p.html, { url: p.url });
+  }
   const rs = require('../index.js');
   if (scenario === 'rs') return (p) => rs.parse(p.html, { url: p.url });
   if (scenario === 'rs-async') return (p) => rs.parseAsync(p.html, { url: p.url });
@@ -73,7 +80,7 @@ function peakRssMb() {
 }
 
 const pages = loadPages();
-const parse = makeParser();
+const parse = await makeParser();
 const bytes = pages.reduce((n, p) => n + Buffer.byteLength(p.html), 0);
 
 async function round(perPage) {

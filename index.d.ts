@@ -46,18 +46,18 @@ export interface Article {
   publishedTime: string | null;
 }
 
-/** Extracts the article. Returns `null` when none is found. Runs on the calling thread. */
-export function parse(html: string, options?: ParseOptions): Article | null;
-
-/** Same as `parse`, on the Node-API thread pool. */
-export function parseAsync(html: string, options?: ParseOptions, signal?: AbortSignal): Promise<Article | null>;
-
 export interface ReaderableOptions {
   /** The minimum node content length used to decide if the document is readerable. Default 140. */
   minContentLength?: number;
   /** The minimum cumulated score used to determine if the document is readerable. Default 20. */
   minScore?: number;
 }
+
+/** Extracts the article. Returns `null` when none is found. Runs on the calling thread. */
+export function parse(html: string, options?: ParseOptions): Article | null;
+
+/** Same as `parse`, on the Node-API thread pool. */
+export function parseAsync(html: string, options?: ParseOptions, signal?: AbortSignal): Promise<Article | null>;
 
 /** Decides whether or not the document is reader-able without parsing the whole thing. */
 export function isProbablyReaderable(html: string, options?: ReaderableOptions): boolean;

@@ -20,6 +20,9 @@ mod readerable;
 #[cfg(feature = "napi")]
 mod node;
 
+#[cfg(feature = "wasm")]
+mod wasm;
+
 pub use dom::{Document, NodeId};
 pub use readability::{Article, Error, Options};
 pub use readerable::ReaderableOptions;

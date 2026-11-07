@@ -1,13 +1,14 @@
 name: CI
 
-# - pull_request / push: build + test on x64 and arm64, check the output
-#   against Readability.js, pack the npm packages and keep them as workflow
-#   artifacts.
+# - pull_request / push: build + test on x64 and arm64, build the wasm
+#   module, check the outputs against Readability.js, pack the npm packages
+#   and keep them as workflow artifacts.
 # - push to main: same, and if the tag v<version> (version = Cargo.toml) does
 #   not exist yet, create it together with a GitHub release carrying
-#   readability-rs-linux-x64-*.tgz, readability-rs-linux-arm64-*.tgz and
-#   readability-rs-*.tgz (both architectures in one package). So releasing
-#   is: bump `version` in Cargo.toml (and Cargo.lock) in a PR, merge.
+#   readability-rs-linux-x64-*.tgz, readability-rs-linux-arm64-*.tgz,
+#   readability-rs-*.tgz (both architectures in one package) and
+#   readability-rs-wasm-*.tgz. So releasing is: bump `version` in Cargo.toml
+#   (and Cargo.lock) in a PR, merge.
 # - push of a matching tag: build + release (manual alternative).
 on:
   push:
@@ -85,8 +86,10 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: |
+          rustup target add wasm32-unknown-unknown
           cargo clippy --lib -- -D warnings
           cargo clippy --no-default-features --all-targets -- -D warnings
+          cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
 
   # Build in Debian bookworm (glibc 2.36), the base of
   # oven/bun:*-debian images, so the addon loads there.
@@ -160,8 +163,52 @@ jobs:
           path: readability-rs.${{ matrix.triple }}.node
           if-no-files-found: error
 
+  # WebAssembly (wasm32-unknown-unknown): the whole crate, no threads.
+  wasm:
+    needs: config
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install Rust target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: wasm-${{ hashFiles('Cargo.lock', 'build.rs') }}
+          restore-keys: |
+            wasm-
+      - uses: actions/cache@v4
+        with:
+          path: tests/test-pages
+          key: test-pages-${{ hashFiles('UPSTREAM_COMMIT') }}
+      - name: Build
+        run: scripts/build-wasm.sh out/wasm
+      - name: Compare with Readability.js
+        run: |
+          ./scripts/fetch-test-pages.sh
+          cd bench
+          bun install --frozen-lockfile
+          # Only the wasm module is compared here; the addon is checked in `build`.
+          WASM_ONLY=1 bun compare.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm
+          path: out/wasm
+          if-no-files-found: error
+
   package:
-    needs: [config, build]
+    needs: [config, build, wasm]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -175,6 +222,10 @@ jobs:
           pattern: addon-*
           path: out
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm
+          path: out/wasm
       - name: Collect licenses
         run: ./scripts/collect-licenses.sh
       - name: Pack
@@ -182,6 +233,7 @@ jobs:
           node scripts/pack.mjs native dist out/readability-rs.linux-x64-gnu.node out/readability-rs.linux-arm64-gnu.node
           node scripts/pack.mjs native-arch dist x64 out/readability-rs.linux-x64-gnu.node
           node scripts/pack.mjs native-arch dist arm64 out/readability-rs.linux-arm64-gnu.node
+          node scripts/pack.mjs wasm dist out/wasm
           for f in dist/*.tgz; do
             echo "== $f"
             tar tzvf "$f"
@@ -216,6 +268,10 @@ jobs:
             exit 1
           fi
           grep -q EBADPLATFORM arm64.log
+
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/dist/readability-rs-wasm-$VERSION.tgz"
+          cp "$GITHUB_WORKSPACE/tests/wasm-smoke.mjs" .
+          node wasm-smoke.mjs readability-rs-wasm
       - uses: actions/upload-artifact@v4
         with:
           name: packages
@@ -247,11 +303,13 @@ jobs:
           | \`readability-rs-linux-x64-${VERSION}.tgz\` | Node-API addon for Linux x64 only (glibc) |
           | \`readability-rs-linux-arm64-${VERSION}.tgz\` | Same for Linux arm64 only |
           | \`readability-rs-${VERSION}.tgz\` | Both architectures bundled in one package |
+          | \`readability-rs-wasm-${VERSION}.tgz\` | WebAssembly build for browsers, workers, Node.js, Bun and Deno |
 
           \`\`\`sh
           npm install ${base}/readability-rs-${VERSION}.tgz
           # or only one architecture (os/cpu fields let package managers skip the other):
           npm install ${base}/readability-rs-linux-x64-${VERSION}.tgz
+          npm install ${base}/readability-rs-wasm-${VERSION}.tgz
           \`\`\`
 
           Each package contains the license files of all bundled code in \`licenses/\`.
@@ -264,4 +322,4 @@ jobs:
           fi
           gh release create "$TAG" "${target[@]}" --title "readability-rs ${VERSION}" --notes-file notes.md \
             dist/readability-rs-${VERSION}.tgz dist/readability-rs-linux-x64-${VERSION}.tgz \
-            dist/readability-rs-linux-arm64-${VERSION}.tgz dist/SHA256SUMS
+            dist/readability-rs-linux-arm64-${VERSION}.tgz dist/readability-rs-wasm-${VERSION}.tgz dist/SHA256SUMS

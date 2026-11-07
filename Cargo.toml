@@ -13,6 +13,8 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["napi"]
 napi = ["dep:napi", "dep:napi-derive"]
+# C ABI exports for the WebAssembly build (scripts/build-wasm.sh).
+wasm = []
 
 [dependencies]
 html5ever = "0.40"
