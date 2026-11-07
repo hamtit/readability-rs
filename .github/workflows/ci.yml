@@ -1,0 +1,325 @@
+name: CI
+
+# - pull_request / push: build + test on x64 and arm64, build the wasm
+#   module, check the outputs against Readability.js, pack the npm packages
+#   and keep them as workflow artifacts.
+# - push to main: same, and if the tag v<version> (version = Cargo.toml) does
+#   not exist yet, create it together with a GitHub release carrying
+#   readability-rs-linux-x64-*.tgz, readability-rs-linux-arm64-*.tgz,
+#   readability-rs-*.tgz (both architectures in one package) and
+#   readability-rs-wasm-*.tgz. So releasing is: bump `version` in Cargo.toml
+#   (and Cargo.lock) in a PR, merge.
+# - push of a matching tag: build + release (manual alternative).
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only superseded PR runs are cancelled; a push to main may be a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  config:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.env.outputs.VERSION }}
+      release: ${{ steps.env.outputs.RELEASE }}
+      tag: ${{ steps.env.outputs.TAG }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: env
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Cargo.toml is the single source of truth for the version.
+          version="$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
+          lock="$(awk '$0 == "name = \"readability-rs\"" { getline; gsub(/version = "|"/, ""); print; exit }' Cargo.lock)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Cargo.toml version '$version' is not a semver version"
+            exit 1
+          fi
+          if [[ "$lock" != "$version" ]]; then
+            echo "::error::Cargo.lock has readability-rs $lock but Cargo.toml has $version; run cargo update -p readability-rs"
+            exit 1
+          fi
+          tag="v${version}"
+          release=false
+          if [[ "$REF_TYPE" == tag ]]; then
+            if [[ "$REF_NAME" != "$tag" ]]; then
+              echo "::error::tag $REF_NAME does not match Cargo.toml (expected $tag)"
+              exit 1
+            fi
+            release=true
+          elif [[ "$EVENT" == push && "$REF_NAME" == main ]]; then
+            if gh api "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null 2>&1; then
+              echo "$tag already exists; not releasing"
+            else
+              release=true
+            fi
+          fi
+          {
+            echo "VERSION=${version}"
+            echo "TAG=${tag}"
+            echo "RELEASE=${release}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy --lib -- -D warnings
+          cargo clippy --no-default-features --all-targets -- -D warnings
+          cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
+
+  # Build in Debian bookworm (glibc 2.36), the base of
+  # oven/bun:*-debian images, so the addon loads there.
+  build:
+    needs: config
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+            triple: linux-x64-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            triple: linux-arm64-gnu
+    runs-on: ${{ matrix.runner }}
+    container: debian:bookworm
+    env:
+      # sccache wraps rustc, so both the test build and the addon build, and
+      # later runs, reuse the same objects.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential \
+            curl ca-certificates git python3 unzip
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ matrix.triple }}-${{ hashFiles('Cargo.lock', 'build.rs') }}
+          restore-keys: |
+            ${{ matrix.triple }}-
+      - uses: actions/cache@v4
+        with:
+          path: tests/test-pages
+          key: test-pages-${{ hashFiles('UPSTREAM_COMMIT') }}
+      - name: Fetch the upstream test pages
+        run: ./scripts/fetch-test-pages.sh
+      - name: Rust tests (upstream test pages included)
+        env:
+          REQUIRE_TEST_PAGES: "1"
+        run: cargo test --release --no-default-features
+      - name: Build addon
+        run: ./scripts/build.sh
+      - name: Addon tests
+        run: |
+          bun install --frozen-lockfile
+          bun test tests/
+      - name: Compare with Readability.js
+        working-directory: bench
+        run: |
+          bun install --frozen-lockfile
+          bun compare.ts
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+      - uses: actions/upload-artifact@v4
+        with:
+          name: addon-${{ matrix.triple }}
+          path: readability-rs.${{ matrix.triple }}.node
+          if-no-files-found: error
+
+  # WebAssembly (wasm32-unknown-unknown): the whole crate, no threads.
+  wasm:
+    needs: config
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install Rust target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: wasm-${{ hashFiles('Cargo.lock', 'build.rs') }}
+          restore-keys: |
+            wasm-
+      - uses: actions/cache@v4
+        with:
+          path: tests/test-pages
+          key: test-pages-${{ hashFiles('UPSTREAM_COMMIT') }}
+      - name: Build
+        run: scripts/build-wasm.sh out/wasm
+      - name: Compare with Readability.js
+        run: |
+          ./scripts/fetch-test-pages.sh
+          cd bench
+          bun install --frozen-lockfile
+          # Only the wasm module is compared here; the addon is checked in `build`.
+          WASM_ONLY=1 bun compare.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm
+          path: out/wasm
+          if-no-files-found: error
+
+  package:
+    needs: [config, build, wasm]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: addon-*
+          path: out
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm
+          path: out/wasm
+      - name: Collect licenses
+        run: ./scripts/collect-licenses.sh
+      - name: Pack
+        run: |
+          node scripts/pack.mjs native dist out/readability-rs.linux-x64-gnu.node out/readability-rs.linux-arm64-gnu.node
+          node scripts/pack.mjs native-arch dist x64 out/readability-rs.linux-x64-gnu.node
+          node scripts/pack.mjs native-arch dist arm64 out/readability-rs.linux-arm64-gnu.node
+          node scripts/pack.mjs wasm dist out/wasm
+          for f in dist/*.tgz; do
+            echo "== $f"
+            tar tzvf "$f"
+          done
+          (cd dist && sha256sum *.tgz | tee SHA256SUMS)
+      - name: Test installed packages
+        env:
+          VERSION: ${{ needs.config.outputs.version }}
+        run: |
+          mkdir -p work/consumer
+          cd work/consumer
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/dist/readability-rs-$VERSION.tgz"
+          node -p "require('readability-rs').versions()"
+          node -e "
+            const rs = require('readability-rs');
+            const v = rs.versions().readabilityRs;
+            if (v !== process.env.VERSION) throw new Error('version ' + v + ' != ' + process.env.VERSION);
+            const p = '<p>' + 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(20) + '</p>';
+            const a = rs.parse('<title>t</title><article>' + p + '</article>', { url: 'https://example.com/' });
+            if (!a || !a.content.includes('Lorem ipsum')) throw new Error('parse failed');
+          "
+
+          # Single-platform package for the runner's architecture; the one for
+          # the other architecture must be refused by os/cpu.
+          npm install --no-audit --no-fund \
+            "$GITHUB_WORKSPACE/dist/readability-rs-linux-x64-$VERSION.tgz"
+          node -p "require('readability-rs-linux-x64').versions()"
+          if npm install --no-audit --no-fund \
+            "$GITHUB_WORKSPACE/dist/readability-rs-linux-arm64-$VERSION.tgz" 2> arm64.log; then
+            echo "::error::arm64 package was installed on x64"
+            exit 1
+          fi
+          grep -q EBADPLATFORM arm64.log
+
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/dist/readability-rs-wasm-$VERSION.tgz"
+          cp "$GITHUB_WORKSPACE/tests/wasm-smoke.mjs" .
+          node wasm-smoke.mjs readability-rs-wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist
+          if-no-files-found: error
+
+  release:
+    if: needs.config.outputs.release == 'true'
+    needs: [config, lint, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.config.outputs.tag }}
+          VERSION: ${{ needs.config.outputs.version }}
+        run: |
+          base="https://github.com/${GH_REPO}/releases/download/${TAG}"
+          cat > notes.md <<NOTES
+          | File | Contents |
+          | --- | --- |
+          | \`readability-rs-linux-x64-${VERSION}.tgz\` | Node-API addon for Linux x64 only (glibc) |
+          | \`readability-rs-linux-arm64-${VERSION}.tgz\` | Same for Linux arm64 only |
+          | \`readability-rs-${VERSION}.tgz\` | Both architectures bundled in one package |
+          | \`readability-rs-wasm-${VERSION}.tgz\` | WebAssembly build for browsers, workers, Node.js, Bun and Deno |
+
+          \`\`\`sh
+          npm install ${base}/readability-rs-${VERSION}.tgz
+          # or only one architecture (os/cpu fields let package managers skip the other):
+          npm install ${base}/readability-rs-linux-x64-${VERSION}.tgz
+          npm install ${base}/readability-rs-wasm-${VERSION}.tgz
+          \`\`\`
+
+          Each package contains the license files of all bundled code in \`licenses/\`.
+          NOTES
+          # For a push to main this also creates the tag on the built commit.
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            target=(--verify-tag)
+          else
+            target=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$TAG" "${target[@]}" --title "readability-rs ${VERSION}" --notes-file notes.md \
+            dist/readability-rs-${VERSION}.tgz dist/readability-rs-linux-x64-${VERSION}.tgz \
+            dist/readability-rs-linux-arm64-${VERSION}.tgz dist/readability-rs-wasm-${VERSION}.tgz dist/SHA256SUMS

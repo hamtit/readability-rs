@@ -1,0 +1,23 @@
+{
+  "name": "readability-rs-wasm",
+  "version": "0.0.0-dev",
+  "private": true,
+  "description": "Mozilla Readability (article extraction) ported to Rust, compiled to WebAssembly",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hamtit/readability-rs.git"
+  },
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./dist/*": "./dist/*",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false
+}

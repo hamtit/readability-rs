@@ -1,0 +1,11 @@
+readability-rs
+A Rust port of Readability (https://github.com/mozilla/readability).
+
+The algorithm and the comments in src/readability.rs and src/readerable.rs
+are derived from Readability.js and Readability-readerable.js 0.6.0:
+
+Readability
+Copyright (c) 2010 Arc90 Inc
+Copyright (c) 2010-2026 Mozilla and Contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
