@@ -1,0 +1,30 @@
+{
+  "name": "readability-rs",
+  "description": "Mozilla Readability (article extraction) ported to Rust, as a Node-API addon",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node",
+    "licenses/",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "test": "bun test tests/"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3"
+  },
+  "private": true
+}
