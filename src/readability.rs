@@ -460,6 +460,24 @@ fn non_empty(s: Option<String>) -> Option<String> {
 /// Parses the `style` attribute just enough to read `display` and
 /// `visibility` (the last valid declaration wins).
 fn style_property(style: &str, name: &str) -> Option<String> {
+    // CSS comments separate tokens like white space (`display: /* x */ none`
+    // is `none`, `no/**/ne` is two words), and may contain `;`.
+    let style: std::borrow::Cow<str> = if style.contains("/*") {
+        let mut out = String::with_capacity(style.len());
+        let mut rest = style;
+        while let Some(i) = rest.find("/*") {
+            out.push_str(&rest[..i]);
+            out.push(' ');
+            rest = match rest[i + 2..].find("*/") {
+                Some(j) => &rest[i + 2 + j + 2..],
+                None => "",
+            };
+        }
+        out.push_str(rest);
+        out.into()
+    } else {
+        style.into()
+    };
     let mut value = None;
     for decl in style.split(';') {
         let Some((prop, val)) = decl.split_once(':') else { continue };
@@ -2672,5 +2690,17 @@ mod tests {
     fn style() {
         assert_eq!(style_property("color: red; display : NONE !important", "display").as_deref(), Some("none"));
         assert_eq!(style_property("display:block;display:none", "display").as_deref(), Some("none"));
+        // As jsdom (CSSOM) reads them.
+        for (style, display) in [
+            ("display: /* hidden */ none", Some("none")),
+            ("display:none/*x*/", Some("none")),
+            ("/*a;b*/display:none", Some("none")),
+            ("display:none;display:block", Some("block")),
+        ] {
+            assert_eq!(style_property(style, "display").as_deref(), display, "{style}");
+        }
+        assert_ne!(style_property("display: no/**/ne", "display").as_deref(), Some("none"));
+        assert_ne!(style_property("display: \"none\"", "display").as_deref(), Some("none"));
+        assert_eq!(style_property("visibility: /*c*/hidden", "visibility").as_deref(), Some("hidden"));
     }
 }

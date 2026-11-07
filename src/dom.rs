@@ -488,9 +488,17 @@ impl Document {
     /// `node.cloneNode(true)`. Template contents are cloned too.
     pub fn deep_clone(&mut self, root: NodeId) -> NodeId {
         let copy = self.shallow_clone(root);
-        // (source, clone) pairs whose children still need copying.
+        // (source, clone) pairs whose children still need copying. Iterative,
+        // including template contents, so deep nesting cannot overflow the stack.
         let mut stack = vec![(root, copy)];
         while let Some((src, dst)) = stack.pop() {
+            if let Some(t) = self.element(src).and_then(|e| e.template_contents) {
+                let t2 = self.push(NodeData::Fragment { owner: Some(dst) });
+                if let Some(e) = self.element_mut(dst) {
+                    e.template_contents = Some(t2);
+                }
+                stack.push((t, t2));
+            }
             let mut child = self.node(src).first;
             while let Some(c) = child {
                 let cc = self.shallow_clone(c);
@@ -502,21 +510,16 @@ impl Document {
         copy
     }
 
+    /// Copies a node without children (or template contents, which
+    /// [`Self::deep_clone`] fills in).
     fn shallow_clone(&mut self, id: NodeId) -> NodeId {
         let mut data = self.node(id).data.clone();
-        if let NodeData::Fragment { owner } = &mut data {
-            *owner = None;
+        match &mut data {
+            NodeData::Fragment { owner } => *owner = None,
+            NodeData::Element(e) => e.template_contents = None,
+            _ => {}
         }
-        let copy = self.push(data);
-        let contents = self.element(copy).and_then(|e| e.template_contents);
-        if let Some(t) = contents {
-            let t2 = self.deep_clone(t);
-            self.node_mut(t2).data = NodeData::Fragment { owner: Some(copy) };
-            if let Some(e) = self.element_mut(copy) {
-                e.template_contents = Some(t2);
-            }
-        }
-        copy
+        self.push(data)
     }
 
     // ----- navigation -----
@@ -952,7 +955,8 @@ impl Document {
     /// stripped and collapsed.
     pub fn title(&self) -> String {
         let doc = self.document();
-        let Some(t) = self.descendants(doc).find(|&n| self.local_name(n) == Some(&local_name!("title"))) else {
+        // The HTML `<title>`, not an SVG `<title>` (an accessibility label).
+        let Some(t) = self.descendants(doc).find(|&n| self.is_html(n, &local_name!("title"))) else {
             return String::new();
         };
         let text = self.child_text_content(t);
@@ -1206,6 +1210,33 @@ mod tests {
         let head = doc.prev_element_sibling(body).unwrap();
         assert_eq!(doc.inner_html(head), "<template><b>x</b></template>");
         assert_eq!(doc.inner_html(body), "<i>y</i>");
+    }
+
+    #[test]
+    fn svg_title_is_not_the_document_title() {
+        let doc = Document::parse("<svg><title>Search</title></svg><p>x</p>", None);
+        assert_eq!(doc.title(), "");
+        let doc = Document::parse("<title> a \n b </title><svg><title>Search</title></svg>", None);
+        assert_eq!(doc.title(), "a b");
+    }
+
+    #[test]
+    fn clone_deeply_nested_templates() {
+        let depth = 20_000;
+        let html = format!("{}x{}", "<template>".repeat(depth), "</template>".repeat(depth));
+        // Clone on a small stack: recursing once per template level would overflow it.
+        let same = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut doc = Document::parse(&html, None);
+                let head = doc.first_element_child(doc.document_element().unwrap()).unwrap();
+                let c = doc.deep_clone(head);
+                doc.inner_html(head) == doc.inner_html(c)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(same);
     }
 
     #[test]
