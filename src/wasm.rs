@@ -5,6 +5,8 @@
 //! pointer to `[ptr, len]` (two u32) describing a UTF-8 buffer, freed with
 //! `rs_free_result`.
 
+use std::mem::MaybeUninit;
+
 use serde_json::{Value, json};
 
 use crate::{Article, Options, ReaderableOptions};
@@ -12,10 +14,8 @@ use crate::{Article, Options, ReaderableOptions};
 /// Allocates `len` bytes (at least 1) for the caller to fill.
 #[unsafe(no_mangle)]
 pub extern "C" fn rs_alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len.max(1));
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
+    // A boxed slice has exactly `len` bytes, which is what `rs_free` relies on to give them back.
+    Box::into_raw(Box::<[u8]>::new_uninit_slice(len.max(1))).cast()
 }
 
 /// Frees a buffer from `rs_alloc` (`len` as passed there).
@@ -24,7 +24,9 @@ pub extern "C" fn rs_alloc(len: usize) -> *mut u8 {
 /// `ptr` must come from `rs_alloc(len)` and not be freed twice.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rs_free(ptr: *mut u8, len: usize) {
-    unsafe { drop(Vec::from_raw_parts(ptr, 0, len.max(1))) };
+    // SAFETY: the caller passes a pointer from `rs_alloc(len)`, a leaked `Box<[MaybeUninit<u8>]>` of
+    // exactly `len.max(1)` bytes, and frees it only once.
+    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len.max(1))) });
 }
 
 /// Frees a result returned by `rs_parse` / `rs_versions`.
@@ -33,18 +35,20 @@ pub unsafe extern "C" fn rs_free(ptr: *mut u8, len: usize) {
 /// `result` must come from one of those functions and not be freed twice.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rs_free_result(result: *mut u32) {
+    // SAFETY: the caller passes a pointer returned by `into_result`, i.e. a leaked `Box<[u32; 2]>`
+    // holding the address and length of a leaked `Box<[u8]>`, and frees it only once.
     unsafe {
-        let r = Box::from_raw(result as *mut [u32; 2]);
-        drop(Vec::from_raw_parts(r[0] as *mut u8, r[1] as usize, r[1] as usize));
+        let r = Box::from_raw(result.cast::<[u32; 2]>());
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(r[0] as *mut u8, r[1] as usize)));
     }
 }
 
 fn into_result(s: String) -> *mut u32 {
-    let mut bytes = s.into_bytes();
-    bytes.shrink_to_fit();
-    let r = Box::new([bytes.as_mut_ptr() as u32, bytes.len() as u32]);
-    std::mem::forget(bytes);
-    Box::into_raw(r) as *mut u32
+    // A boxed slice has exactly `len` bytes, which `rs_free_result` relies on to give them back.
+    let bytes = s.into_bytes().into_boxed_slice();
+    let len = bytes.len();
+    let ptr = Box::into_raw(bytes).cast::<u8>();
+    Box::into_raw(Box::new([ptr as u32, len as u32])).cast()
 }
 
 /// # Safety
@@ -53,6 +57,7 @@ unsafe fn str_arg<'a>(ptr: *const u8, len: usize) -> &'a str {
     if len == 0 {
         return "";
     }
+    // SAFETY: the caller guarantees `ptr..ptr+len` is readable and valid UTF-8 (see `# Safety`).
     unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
 }
 
@@ -103,7 +108,9 @@ fn article_json(a: Article) -> Value {
 /// Both arguments must be valid UTF-8 buffers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rs_parse(html: *const u8, html_len: usize, opts: *const u8, opts_len: usize) -> *mut u32 {
+    // SAFETY: the caller guarantees both buffers are valid UTF-8 (see `# Safety`).
     let html = unsafe { str_arg(html, html_len) };
+    // SAFETY: as above.
     let opts = unsafe { str_arg(opts, opts_len) };
     let out = (|| -> Result<Value, String> {
         let o: Value =
@@ -127,6 +134,7 @@ pub unsafe extern "C" fn rs_is_probably_readerable(
     min_content_length: f64,
     min_score: f64,
 ) -> u32 {
+    // SAFETY: the caller guarantees `html` is a valid UTF-8 buffer (see `# Safety`).
     let html = unsafe { str_arg(html, html_len) };
     let mut o = ReaderableOptions::default();
     if min_content_length >= 0.0 {
